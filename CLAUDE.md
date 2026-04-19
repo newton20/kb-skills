@@ -13,8 +13,9 @@ skills/         # Claude Code skill files (SKILL.md per skill)
   kb-status/    # Show KB status
   kb-lint/      # Full health check
   kb-explore/   # Find unexplored connections
+  x-api/        # X/Twitter API reference (auth, posting, reading, article bodies)
 scripts/        # Node.js automation (shared across all KBs)
-  ingest.js     # URL fetching with 3-tier fallback
+  ingest.js     # URL fetching. X Articles: ScrapeCreators -> X API v2 article.plain_text -> xAI Grok
   compile.js    # Delta computation, index generation, health checks
   query.js      # Query output naming
 ```
