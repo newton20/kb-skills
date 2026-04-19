@@ -1,0 +1,9 @@
+interface:
+  display_name: "X API"
+  short_description: "X/Twitter API integration for posting, threads, and analytics"
+  brand_color: "#000000"
+  default_prompt: "Use X API to post tweets, threads, or retrieve timeline and search data"
+policy:
+  # Hardened: upstream had this set to true. Flipped to require explicit /x-api
+  # or user-named invocation. See SKILL.md provenance block for details.
+  allow_implicit_invocation: false
