@@ -14,6 +14,38 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Optionally pull ingest credentials from an additional env file pointed at
+// by KB_ENV_FILE. Useful when API tokens are stored alongside other project
+// secrets in a shared file outside the repo. Only the allowlisted ingest
+// secrets are loaded; other secrets in that file are ignored. Does not
+// override existing env vars.
+const KB_ENV_ALLOWED = (key) =>
+  key.startsWith('X_') ||
+  key === 'XAI_API_KEY' ||
+  key === 'SCRAPECREATORS_API_KEY';
+
+(function loadSharedIngestEnv() {
+  const sharedEnvPath = process.env.KB_ENV_FILE;
+  if (!sharedEnvPath || !fs.existsSync(sharedEnvPath)) return;
+  try {
+    const content = fs.readFileSync(sharedEnvPath, 'utf8');
+    for (const line of content.split(/\r?\n/)) {
+      const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+      if (!m) continue;
+      const key = m[1];
+      if (!KB_ENV_ALLOWED(key) || process.env[key]) continue;
+      let value = m[2].trim();
+      if ((value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      process.env[key] = value;
+    }
+  } catch (err) {
+    console.warn(`  ⚠ Could not read KB_ENV_FILE (${sharedEnvPath}): ${err.message}`);
+  }
+})();
+
 const MANIFEST_PATH = path.join(__dirname, '..', 'ingest_manifest.json');
 const RAW_DIR = path.join(__dirname, '..', 'raw');
 const IMG_DIR = path.join(RAW_DIR, 'images');
@@ -198,7 +230,55 @@ function extractTweetContent(data) {
   return { text, author, handle, date, likes, retweets, views, media, links };
 }
 
-// ── xAI Grok API (for X Articles) ───────────────────────────
+// ── X API v2 Article (authoritative source for X Articles) ───
+
+async function fetchViaXApiArticle(url) {
+  const bearer = process.env.X_BEARER_TOKEN;
+  if (!bearer) {
+    throw new Error(
+      'X_BEARER_TOKEN not set.\n' +
+      'Why: Preferred X Article path uses X API v2 article.plain_text field.\n' +
+      'Fix: Add X_BEARER_TOKEN=<your-bearer> to .env (or /knowledge_base/.env.txt).'
+    );
+  }
+  const tweetId = extractTweetId(url);
+  if (!tweetId) throw new Error(`Cannot extract tweet ID from ${url}`);
+
+  const params = new URLSearchParams({
+    'tweet.fields': 'created_at,public_metrics,text,lang,article,note_tweet',
+    'expansions': 'author_id',
+    'user.fields': 'username,name',
+  });
+  const apiUrl = `https://api.x.com/2/tweets/${tweetId}?${params}`;
+  const res = await httpRequest(apiUrl, {
+    headers: { 'Authorization': `Bearer ${bearer}` }
+  });
+  const data = JSON.parse(res.body);
+  if (!data.data) {
+    throw new Error(`X API returned no data: ${JSON.stringify(data).slice(0, 300)}`);
+  }
+  const tweet = data.data;
+  // This path is only for X Articles. Long note_tweet posts are regular tweets
+  // with rich metadata (media, links, engagement) that ScrapeCreators handles
+  // better — don't collapse them into an article shell with false provenance.
+  const article = tweet.article;
+  if (!article || !article.plain_text) {
+    throw new Error(`Tweet ${tweetId} has no article.plain_text (not an X Article)`);
+  }
+  const user = (data.includes?.users || []).find(u => u.id === tweet.author_id) || {};
+  return {
+    title: article.title || '',
+    plainText: article.plain_text,
+    author: user.name || '',
+    handle: user.username || extractHandle(url),
+    createdAt: tweet.created_at || '',
+    date: tweet.created_at ? tweet.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10),
+    metrics: tweet.public_metrics || {},
+    isXArticle: true,
+  };
+}
+
+// ── xAI Grok API (for X Articles — last resort only) ────────
 
 async function fetchViaXaiGrok(url) {
   const apiKey = process.env.XAI_API_KEY;
@@ -311,15 +391,35 @@ function tweetToMarkdown(url, content, tweetId) {
   return md;
 }
 
-function articleToMarkdown(url, text, handle) {
-  let md = `---\ntitle: "X Article by ${handle}"\n`;
+function articleToMarkdown(url, text, handle, meta = {}) {
+  const titleStr = meta.title
+    ? `"${meta.title.replace(/"/g, '\\"')}"`
+    : `"X Article by ${handle}"`;
+  const date = meta.date || new Date().toISOString().slice(0, 10);
+
+  let md = `---\ntitle: ${titleStr}\n`;
   md += `source: ${url}\n`;
+  if (meta.author) md += `author: ${meta.author}\n`;
   md += `handle: ${handle}\n`;
-  md += `date: ${new Date().toISOString().slice(0, 10)}\n`;
+  md += `date: ${date}\n`;
   md += `fetched: ${new Date().toISOString().slice(0, 10)}\n`;
   md += `type: article\n`;
   md += `status: raw\n`;
+  if (meta.sourceMethod) md += `source_method: ${meta.sourceMethod}\n`;
   md += `---\n\n`;
+
+  if (meta.title) md += `# ${meta.title}\n\n`;
+  if (meta.author) md += `**By ${meta.author} (@${handle}) — posted ${date}**\n`;
+  if (meta.metrics && typeof meta.metrics.like_count === 'number') {
+    const m = meta.metrics;
+    md += `**Public metrics:** ${(m.like_count || 0).toLocaleString()} likes · ` +
+          `${(m.retweet_count || 0).toLocaleString()} reposts · ` +
+          `${(m.reply_count || 0).toLocaleString()} replies · ` +
+          `${(m.quote_count || 0).toLocaleString()} quotes · ` +
+          `${(m.bookmark_count || 0).toLocaleString()} bookmarks · ` +
+          `${(m.impression_count || 0).toLocaleString()} impressions\n`;
+  }
+  if (meta.title || meta.author) md += '\n';
   md += text;
   return md;
 }
@@ -362,16 +462,43 @@ async function ingestUrl(url, manifest, dryRun = false) {
 
       const isUrlOnly = /^\s*https?:\/\/\S+\s*$/.test(content.text);
       if (!content.text || content.text.length < 100 || isUrlOnly) {
-        // Likely an X Article — fall back to Grok
-        console.log(`  Short/empty content. Falling back to xAI Grok (X Article)...`);
-        const articleText = await fetchViaXaiGrok(url);
+        // Likely an X Article. Try X API v2 article.plain_text first
+        // (authoritative). Fall back to xAI Grok only if X API fails.
+        console.log(`  Short/empty content. Trying X API v2 article endpoint...`);
+        let articleText = null;
+        let meta = {};
+        let sourceMethod = null;
+        try {
+          const xApi = await fetchViaXApiArticle(url);
+          articleText = xApi.plainText;
+          meta = {
+            title: xApi.title,
+            author: xApi.author,
+            date: xApi.date,
+            metrics: xApi.metrics,
+          };
+          sourceMethod = 'x_api_v2_article_plain_text';
+          console.log(`  ✓ X API v2: ${articleText.length} chars${xApi.title ? ` — "${xApi.title}"` : ''}`);
+        } catch (xApiErr) {
+          console.log(`  X API article failed: ${xApiErr.message.split('\n')[0]}`);
+          console.log(`  Falling back to xAI Grok (may hallucinate)...`);
+          articleText = await fetchViaXaiGrok(url);
+          sourceMethod = 'xai_grok_fallback';
+        }
         if (articleText) {
+          meta.sourceMethod = sourceMethod;
           const filename = `${handle}-${tweetId}.md`;
           const filepath = path.join(RAW_DIR, filename);
-          fs.writeFileSync(filepath, articleToMarkdown(url, articleText, handle));
-          manifest[url] = { status: 'fetched', file: `raw/${filename}`, type: 'x_article', fetched_at: new Date().toISOString() };
-          console.log(`  ✓ Saved X Article → raw/${filename} (${articleText.length} chars)`);
-          appendLog(`Ingested X Article: ${url} → raw/${filename}`);
+          fs.writeFileSync(filepath, articleToMarkdown(url, articleText, handle, meta));
+          manifest[url] = {
+            status: 'fetched',
+            file: `raw/${filename}`,
+            type: 'x_article',
+            source_method: sourceMethod,
+            fetched_at: new Date().toISOString(),
+          };
+          console.log(`  ✓ Saved X Article → raw/${filename} (${articleText.length} chars, ${sourceMethod})`);
+          appendLog(`Ingested X Article via ${sourceMethod}: ${url} → raw/${filename}`);
           return;
         }
       }
@@ -405,23 +532,56 @@ async function ingestUrl(url, manifest, dryRun = false) {
       appendLog(`Ingested tweet: ${url} → raw/${filename}`);
 
     } catch (err) {
-      // ScrapeCreators failed entirely — try Grok
+      // ScrapeCreators failed entirely. Try X API v2 article endpoint first
+      // (authoritative, no hallucination). Grok only as last resort.
       console.log(`  ScrapeCreators failed: ${err.message}`);
-      console.log(`  Falling back to xAI Grok...`);
+      let articleText = null;
+      let meta = {};
+      let sourceMethod = null;
+
       try {
-        const articleText = await fetchViaXaiGrok(url);
-        if (articleText) {
-          const filename = `${handle}-${tweetId}.md`;
-          const filepath = path.join(RAW_DIR, filename);
-          fs.writeFileSync(filepath, articleToMarkdown(url, articleText, handle));
-          manifest[url] = { status: 'fetched', file: `raw/${filename}`, type: 'x_article_fallback', fetched_at: new Date().toISOString() };
-          console.log(`  ✓ Saved via Grok fallback → raw/${filename}`);
-          appendLog(`Ingested via Grok fallback: ${url} → raw/${filename}`);
+        console.log(`  Trying X API v2 article endpoint...`);
+        const xApi = await fetchViaXApiArticle(url);
+        articleText = xApi.plainText;
+        meta = {
+          title: xApi.title,
+          author: xApi.author,
+          date: xApi.date,
+          metrics: xApi.metrics,
+        };
+        sourceMethod = 'x_api_v2_article_plain_text';
+        console.log(`  ✓ X API v2: ${articleText.length} chars${xApi.title ? ` — "${xApi.title}"` : ''}`);
+      } catch (xApiErr) {
+        console.log(`  X API article failed: ${xApiErr.message.split('\n')[0]}`);
+        console.log(`  Falling back to xAI Grok (may hallucinate)...`);
+        try {
+          articleText = await fetchViaXaiGrok(url);
+          sourceMethod = 'xai_grok_fallback';
+        } catch (grokErr) {
+          console.error(`  ✗ ScrapeCreators + X API + Grok all failed.`);
+          manifest[url] = {
+            status: 'failed',
+            error: `ScrapeCreators: ${err.message}; XApi: ${xApiErr.message}; Grok: ${grokErr.message}`,
+            fetched_at: new Date().toISOString(),
+          };
           return;
         }
-      } catch (grokErr) {
-        console.error(`  ✗ Both APIs failed. ScrapeCreators: ${err.message}. Grok: ${grokErr.message}`);
-        manifest[url] = { status: 'failed', error: `ScrapeCreators: ${err.message}; Grok: ${grokErr.message}`, fetched_at: new Date().toISOString() };
+      }
+
+      if (articleText) {
+        meta.sourceMethod = sourceMethod;
+        const filename = `${handle}-${tweetId}.md`;
+        const filepath = path.join(RAW_DIR, filename);
+        fs.writeFileSync(filepath, articleToMarkdown(url, articleText, handle, meta));
+        manifest[url] = {
+          status: 'fetched',
+          file: `raw/${filename}`,
+          type: 'x_article',
+          source_method: sourceMethod,
+          fetched_at: new Date().toISOString(),
+        };
+        console.log(`  ✓ Saved X Article → raw/${filename} (${articleText.length} chars, ${sourceMethod})`);
+        appendLog(`Ingested X Article via ${sourceMethod} (ScrapeCreators down): ${url} → raw/${filename}`);
       }
     }
   } else if (classified.type === 'github_repo') {

@@ -13,12 +13,13 @@ Built for Claude Code. Works with any topic.
 | Skill | Command | What it does |
 |-------|---------|-------------|
 | `kb-init` | `/kb-init "topic"` | Scaffold a new KB (folders, CLAUDE.md, scripts, git init) |
-| `kb-ingest` | `/kb-ingest url` | Fetch URLs into `raw/` (tweets via ScrapeCreators, web via HTTPS/agent-browser/Grok) |
+| `kb-ingest` | `/kb-ingest url` | Fetch URLs into `raw/` (tweets via ScrapeCreators, X Articles via X API v2, web via HTTPS/agent-browser/Grok) |
 | `kb-compile` | `/kb-compile` | Build wiki from raw sources. Supervised mode for <=5 sources, cross-pollinates across 5-15 pages per source |
 | `kb-query` | `/kb-query "question"` | Answer questions from the wiki with citations. `--report` for long-form |
 | `kb-lint` | `/kb-lint` | Full health check: structural + semantic (contradictions, staleness, gaps). Generates `wiki/lint-report-YYYY-MM-DD.md` |
 | `kb-explore` | `/kb-explore` | Find 5 unexplored connections between topics. Offer to create wiki pages |
 | `kb-status` | `/kb-status` | Dashboard: source count, article count, last compile, pending work |
+| `x-api` | `/x-api` | X/Twitter API integration (posting, reading, search, analytics). Hardened fork: no implicit invocation, writes require explicit confirmation |
 
 ## Install
 
@@ -29,7 +30,7 @@ Copy the skills into your Claude Code skills directory:
 git clone https://github.com/newton20/kb-skills.git
 
 # Copy skills
-cp -r kb-skills/skills/kb-* ~/.claude/skills/
+cp -r kb-skills/skills/* ~/.claude/skills/
 
 # Copy scripts to your KB project
 cp -r kb-skills/scripts/ your-kb-project/scripts/
@@ -81,7 +82,7 @@ raw_source_list.txt    /kb-ingest     raw/*.md        /kb-compile      wiki/*.md
 2. `agent-browser --headed` (Cloudflare-protected sites)
 3. xAI Grok (last resort, uses X search)
 
-X/Twitter URLs use ScrapeCreators API for tweets, with Grok fallback for X Articles.
+X/Twitter URLs use ScrapeCreators API for tweets. For X Articles (long-form posts where the tweet text is URL-only), ingestion prefers X API v2's `article.plain_text` field — authoritative, no hallucination — and falls back to xAI Grok only when the X API is unavailable. See the [`x-api`](skills/x-api/SKILL.md) skill for the full API reference.
 
 **Compile** follows the Karpathy methodology:
 - Each source touches 5-15 wiki pages (cross-pollination)
@@ -117,12 +118,17 @@ your-kb/
 
 ## API Keys
 
-The ingest script uses two optional APIs:
+The ingest script uses these APIs (all optional, but ingest degrades gracefully through the fallback chain):
 
 - **SCRAPECREATORS_API_KEY** — For fetching tweets ([scrapecreators.com](https://scrapecreators.com))
-- **XAI_API_KEY** — For X Articles and fallback fetching ([x.ai](https://x.ai))
+- **X_BEARER_TOKEN** — For X Articles via X API v2 (`article.plain_text`). Preferred over Grok fallback. Get one from [developer.x.com](https://developer.x.com). Posting also requires `X_CONSUMER_KEY`, `X_CONSUMER_SECRET`, `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET`.
+- **XAI_API_KEY** — Last-resort fallback for X Articles and Cloudflare-blocked web pages ([x.ai](https://x.ai))
 
-Add them to `.env` in your KB project root.
+Add keys to `.env` in your KB project root. Alternatively, if X tokens live in a shared file outside the project, point at it with the `KB_ENV_FILE` env var — the ingest script will load only `X_*` variables from that file (other secrets are ignored):
+
+```bash
+KB_ENV_FILE="$HOME/secrets/api.txt" npm run ingest
+```
 
 ## Requirements
 
