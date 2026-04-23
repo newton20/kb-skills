@@ -132,6 +132,33 @@ function fetchViaAgentBrowser(url) {
 // that redirect /pdf/X → /download/paper.pdf without an absolute prefix).
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+// Pipe a response stream to a file, cleaning up the partial file on any error
+// from the request, response, or write side. Node's `pipe` does not reliably
+// propagate `res` errors to the write stream's `error` handler, so we listen
+// on both sources and unlink on either path.
+function pipeResponseToFile(res, filepath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(filepath);
+    let settled = false;
+    const cleanup = err => {
+      if (settled) return;
+      settled = true;
+      file.destroy();
+      fs.unlink(filepath, () => {});
+      reject(err);
+    };
+    res.on('error', cleanup);
+    file.on('error', cleanup);
+    file.on('finish', () => {
+      if (settled) return;
+      settled = true;
+      file.close();
+      resolve(filepath);
+    });
+    res.pipe(file);
+  });
+}
+
 function downloadImage(url, filepath) {
   return new Promise((resolve, reject) => {
     https.get(url, res => {
@@ -145,10 +172,7 @@ function downloadImage(url, filepath) {
         res.resume();
         return reject(new Error(`HTTP ${res.statusCode}`));
       }
-      const file = fs.createWriteStream(filepath);
-      res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(filepath); });
-      file.on('error', err => { fs.unlink(filepath, () => {}); reject(err); });
+      pipeResponseToFile(res, filepath).then(resolve).catch(reject);
     }).on('error', reject);
   });
 }
@@ -166,10 +190,7 @@ function downloadBinary(url, filepath) {
         res.resume();
         return reject(new Error(`HTTP ${res.statusCode}`));
       }
-      const file = fs.createWriteStream(filepath);
-      res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(filepath); });
-      file.on('error', err => { fs.unlink(filepath, () => {}); reject(err); });
+      pipeResponseToFile(res, filepath).then(resolve).catch(reject);
     }).on('error', reject);
   });
 }
@@ -196,8 +217,11 @@ function arxivPdfToHtmlUrl(url) {
 async function fetchViaPdftotext(url) {
   const { execSync } = require('child_process');
   const tmpPdf = path.join(CACHE_DIR, `pdf-${crypto.randomBytes(6).toString('hex')}.pdf`);
-  await downloadBinary(url, tmpPdf);
+  // The download step is inside the try so its failure path also runs the
+  // cleanup — otherwise a failed fetch leaves orphan pdf-*.pdf files in the
+  // cache dir that accumulate over repeated retries.
   try {
+    await downloadBinary(url, tmpPdf);
     // Note: `pdftotext -v` exits with a non-zero code on some builds (e.g. xpdf
     // fork prints version to stderr and exits 99), so we skip a preflight probe
     // and let extraction surface a useful error if the binary is missing.
