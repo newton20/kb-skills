@@ -30,11 +30,14 @@ const KB_ENV_ALLOWED = (key) =>
   try {
     const content = fs.readFileSync(sharedEnvPath, 'utf8');
     for (const line of content.split(/\r?\n/)) {
-      const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+      // Tolerate shell-style whitespace around `=` (e.g. `X_BEARER_TOKEN = ...`)
+      // that strict dotenv parsers reject — common in hand-edited shared env
+      // files like devbox_shared/api.txt.
+      const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/);
       if (!m) continue;
       const key = m[1];
       if (!KB_ENV_ALLOWED(key) || process.env[key]) continue;
-      let value = m[2].trim();
+      let value = m[2];
       if ((value.startsWith('"') && value.endsWith('"')) ||
           (value.startsWith("'") && value.endsWith("'"))) {
         value = value.slice(1, -1);
@@ -124,18 +127,126 @@ function fetchViaAgentBrowser(url) {
   });
 }
 
-function downloadImage(url, filepath) {
+// Follow standard HTTP redirects (301/302/303/307/308) and resolve relative
+// Location headers against the current URL (common on academic paper hosts
+// that redirect /pdf/X → /download/paper.pdf without an absolute prefix).
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+// Pipe a response stream to a file, cleaning up the partial file on any error
+// from the request, response, or write side. Node's `pipe` does not reliably
+// propagate `res` errors to the write stream's `error` handler, so we listen
+// on both sources and unlink on either path.
+function pipeResponseToFile(res, filepath) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(filepath);
+    let settled = false;
+    const cleanup = err => {
+      if (settled) return;
+      settled = true;
+      file.destroy();
+      fs.unlink(filepath, () => {});
+      reject(err);
+    };
+    res.on('error', cleanup);
+    file.on('error', cleanup);
+    file.on('finish', () => {
+      if (settled) return;
+      settled = true;
+      file.close();
+      resolve(filepath);
+    });
+    res.pipe(file);
+  });
+}
+
+function downloadImage(url, filepath) {
+  return new Promise((resolve, reject) => {
     https.get(url, res => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        downloadImage(res.headers.location, filepath).then(resolve).catch(reject);
+      if (REDIRECT_STATUSES.has(res.statusCode) && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        downloadImage(next, filepath).then(resolve).catch(reject);
         return;
       }
-      res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(filepath); });
-    }).on('error', err => { fs.unlink(filepath, () => {}); reject(err); });
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      pipeResponseToFile(res, filepath).then(resolve).catch(reject);
+    }).on('error', reject);
   });
+}
+
+function downloadBinary(url, filepath) {
+  return new Promise((resolve, reject) => {
+    https.get(url, res => {
+      if (REDIRECT_STATUSES.has(res.statusCode) && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        downloadBinary(next, filepath).then(resolve).catch(reject);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      pipeResponseToFile(res, filepath).then(resolve).catch(reject);
+    }).on('error', reject);
+  });
+}
+
+// ── PDF extraction (pdftotext from poppler-utils) ────────────
+
+function isPdfUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.pathname.toLowerCase().endsWith('.pdf')) return true;
+    // arxiv: /pdf/<id> with optional version suffix, no .pdf extension
+    if (u.hostname.includes('arxiv.org') && /^\/pdf\/[\d.]+(v\d+)?$/.test(u.pathname)) return true;
+    return false;
+  } catch { return false; }
+}
+
+function arxivPdfToHtmlUrl(url) {
+  // arxiv.org/pdf/2604.15034 or arxiv.org/pdf/2604.15034v1 → arxiv.org/html/2604.15034[v1]
+  const m = url.match(/arxiv\.org\/pdf\/([\d.]+)(v\d+)?(?:\.pdf)?$/);
+  if (!m) return null;
+  return `https://arxiv.org/html/${m[1]}${m[2] || ''}`;
+}
+
+async function fetchViaPdftotext(url) {
+  const { execSync } = require('child_process');
+  const tmpPdf = path.join(CACHE_DIR, `pdf-${crypto.randomBytes(6).toString('hex')}.pdf`);
+  // The download step is inside the try so its failure path also runs the
+  // cleanup — otherwise a failed fetch leaves orphan pdf-*.pdf files in the
+  // cache dir that accumulate over repeated retries.
+  try {
+    await downloadBinary(url, tmpPdf);
+    // Note: `pdftotext -v` exits with a non-zero code on some builds (e.g. xpdf
+    // fork prints version to stderr and exits 99), so we skip a preflight probe
+    // and let extraction surface a useful error if the binary is missing.
+    // Default reading-order mode (no -layout) — on 2-column academic PDFs it
+    // produces a coherent column-by-column flow; -layout interleaves columns.
+    return execSync(`pdftotext "${tmpPdf}" -`, {
+      encoding: 'utf8',
+      maxBuffer: 50 * 1024 * 1024,
+    });
+  } catch (err) {
+    // ENOENT or 127 means the binary isn't on PATH
+    const notFound = err.code === 'ENOENT' || err.status === 127 ||
+      /not recognized|not found|command not found/i.test(err.message);
+    if (notFound) {
+      throw new Error(
+        'pdftotext not installed on PATH.\n' +
+        'Why: poppler-utils / xpdf provides the pdftotext binary used to extract text from PDFs.\n' +
+        'Fix: Git-for-Windows already ships it at C:\\Program Files\\Git\\mingw64\\bin\\pdftotext.exe. ' +
+        'Otherwise: macOS `brew install poppler`, Ubuntu `apt install poppler-utils`, MSYS2 `pacman -S mingw-w64-x86_64-poppler`.'
+      );
+    }
+    throw err;
+  } finally {
+    try { fs.unlinkSync(tmpPdf); } catch {}
+  }
 }
 
 // ── URL Classification ───────────────────────────────────────
@@ -154,6 +265,9 @@ function classifyUrl(url) {
     }
     if (host === 'github.com' || host === 'www.github.com') {
       return { type: 'github_repo', url };
+    }
+    if (isPdfUrl(url)) {
+      return { type: 'pdf_document', url };
     }
     return { type: 'web_article', url };
   } catch {
@@ -258,23 +372,36 @@ async function fetchViaXApiArticle(url) {
     throw new Error(`X API returned no data: ${JSON.stringify(data).slice(0, 300)}`);
   }
   const tweet = data.data;
-  // This path is only for X Articles. Long note_tweet posts are regular tweets
-  // with rich metadata (media, links, engagement) that ScrapeCreators handles
-  // better — don't collapse them into an article shell with false provenance.
+  // Prefer article.plain_text (X Article long-form). If absent, fall back to
+  // note_tweet.text (long regular tweet, authoritative full text, no truncation).
+  // Both beat the xAI Grok reconstruction path, which hallucinates on recent
+  // posts not yet in the x_search index.
   const article = tweet.article;
-  if (!article || !article.plain_text) {
-    throw new Error(`Tweet ${tweetId} has no article.plain_text (not an X Article)`);
+  let plainText, sourceMethod, title, isXArticle;
+  if (article && article.plain_text) {
+    plainText = article.plain_text;
+    sourceMethod = 'x_api_v2_article_plain_text';
+    title = article.title || '';
+    isXArticle = true;
+  } else if (tweet.note_tweet && tweet.note_tweet.text) {
+    plainText = tweet.note_tweet.text;
+    sourceMethod = 'x_api_v2_note_tweet_text';
+    title = '';
+    isXArticle = false;
+  } else {
+    throw new Error(`Tweet ${tweetId} has no article.plain_text or note_tweet.text`);
   }
   const user = (data.includes?.users || []).find(u => u.id === tweet.author_id) || {};
   return {
-    title: article.title || '',
-    plainText: article.plain_text,
+    title,
+    plainText,
+    sourceMethod,
     author: user.name || '',
     handle: user.username || extractHandle(url),
     createdAt: tweet.created_at || '',
     date: tweet.created_at ? tweet.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10),
     metrics: tweet.public_metrics || {},
-    isXArticle: true,
+    isXArticle,
   };
 }
 
@@ -392,9 +519,17 @@ function tweetToMarkdown(url, content, tweetId) {
 }
 
 function articleToMarkdown(url, text, handle, meta = {}) {
+  // An X Article has a title and structured long-form content; a note_tweet
+  // is a long regular tweet with authoritative text but no article framing.
+  // Frontmatter type follows the KB convention: `article` for X Articles,
+  // `tweet` for note_tweets, so compile.js routes them the same way as other
+  // tweets (read as tweet evidence, not article prose).
+  const isXArticle = meta.isXArticle !== false;
   const titleStr = meta.title
     ? `"${meta.title.replace(/"/g, '\\"')}"`
-    : `"X Article by ${handle}"`;
+    : isXArticle
+      ? `"X Article by ${handle}"`
+      : `"Long tweet by @${handle}"`;
   const date = meta.date || new Date().toISOString().slice(0, 10);
 
   let md = `---\ntitle: ${titleStr}\n`;
@@ -403,7 +538,7 @@ function articleToMarkdown(url, text, handle, meta = {}) {
   md += `handle: ${handle}\n`;
   md += `date: ${date}\n`;
   md += `fetched: ${new Date().toISOString().slice(0, 10)}\n`;
-  md += `type: article\n`;
+  md += `type: ${isXArticle ? 'article' : 'tweet'}\n`;
   md += `status: raw\n`;
   if (meta.sourceMethod) md += `source_method: ${meta.sourceMethod}\n`;
   md += `---\n\n`;
@@ -468,17 +603,20 @@ async function ingestUrl(url, manifest, dryRun = false) {
         let articleText = null;
         let meta = {};
         let sourceMethod = null;
+        let isXArticle = true;
         try {
           const xApi = await fetchViaXApiArticle(url);
           articleText = xApi.plainText;
+          isXArticle = xApi.isXArticle;
           meta = {
             title: xApi.title,
             author: xApi.author,
             date: xApi.date,
             metrics: xApi.metrics,
+            isXArticle,
           };
-          sourceMethod = 'x_api_v2_article_plain_text';
-          console.log(`  ✓ X API v2: ${articleText.length} chars${xApi.title ? ` — "${xApi.title}"` : ''}`);
+          sourceMethod = xApi.sourceMethod;
+          console.log(`  ✓ X API v2 (${sourceMethod.replace('x_api_v2_', '')}): ${articleText.length} chars${xApi.title ? ` — "${xApi.title}"` : ''}`);
         } catch (xApiErr) {
           console.log(`  X API article failed: ${xApiErr.message.split('\n')[0]}`);
           console.log(`  Falling back to xAI Grok (may hallucinate)...`);
@@ -490,15 +628,17 @@ async function ingestUrl(url, manifest, dryRun = false) {
           const filename = `${handle}-${tweetId}.md`;
           const filepath = path.join(RAW_DIR, filename);
           fs.writeFileSync(filepath, articleToMarkdown(url, articleText, handle, meta));
+          const manifestType = isXArticle ? 'x_article' : 'tweet';
+          const label = isXArticle ? 'X Article' : 'long tweet';
           manifest[url] = {
             status: 'fetched',
             file: `raw/${filename}`,
-            type: 'x_article',
+            type: manifestType,
             source_method: sourceMethod,
             fetched_at: new Date().toISOString(),
           };
-          console.log(`  ✓ Saved X Article → raw/${filename} (${articleText.length} chars, ${sourceMethod})`);
-          appendLog(`Ingested X Article via ${sourceMethod}: ${url} → raw/${filename}`);
+          console.log(`  ✓ Saved ${label} → raw/${filename} (${articleText.length} chars, ${sourceMethod})`);
+          appendLog(`Ingested ${label} via ${sourceMethod}: ${url} → raw/${filename}`);
           return;
         }
       }
@@ -539,18 +679,21 @@ async function ingestUrl(url, manifest, dryRun = false) {
       let meta = {};
       let sourceMethod = null;
 
+      let isXArticle = true;
       try {
         console.log(`  Trying X API v2 article endpoint...`);
         const xApi = await fetchViaXApiArticle(url);
         articleText = xApi.plainText;
+        isXArticle = xApi.isXArticle;
         meta = {
           title: xApi.title,
           author: xApi.author,
           date: xApi.date,
           metrics: xApi.metrics,
+          isXArticle,
         };
-        sourceMethod = 'x_api_v2_article_plain_text';
-        console.log(`  ✓ X API v2: ${articleText.length} chars${xApi.title ? ` — "${xApi.title}"` : ''}`);
+        sourceMethod = xApi.sourceMethod;
+        console.log(`  ✓ X API v2 (${sourceMethod.replace('x_api_v2_', '')}): ${articleText.length} chars${xApi.title ? ` — "${xApi.title}"` : ''}`);
       } catch (xApiErr) {
         console.log(`  X API article failed: ${xApiErr.message.split('\n')[0]}`);
         console.log(`  Falling back to xAI Grok (may hallucinate)...`);
@@ -573,15 +716,17 @@ async function ingestUrl(url, manifest, dryRun = false) {
         const filename = `${handle}-${tweetId}.md`;
         const filepath = path.join(RAW_DIR, filename);
         fs.writeFileSync(filepath, articleToMarkdown(url, articleText, handle, meta));
+        const manifestType = isXArticle ? 'x_article' : 'tweet';
+        const label = isXArticle ? 'X Article' : 'long tweet';
         manifest[url] = {
           status: 'fetched',
           file: `raw/${filename}`,
-          type: 'x_article',
+          type: manifestType,
           source_method: sourceMethod,
           fetched_at: new Date().toISOString(),
         };
-        console.log(`  ✓ Saved X Article → raw/${filename} (${articleText.length} chars, ${sourceMethod})`);
-        appendLog(`Ingested X Article via ${sourceMethod} (ScrapeCreators down): ${url} → raw/${filename}`);
+        console.log(`  ✓ Saved ${label} → raw/${filename} (${articleText.length} chars, ${sourceMethod})`);
+        appendLog(`Ingested ${label} via ${sourceMethod} (ScrapeCreators down): ${url} → raw/${filename}`);
       }
     }
   } else if (classified.type === 'github_repo') {
@@ -603,6 +748,98 @@ async function ingestUrl(url, manifest, dryRun = false) {
     } catch (err) {
       console.error(`  ✗ GitHub fetch failed: ${err.message}`);
       manifest[url] = { status: 'failed', error: err.message, fetched_at: new Date().toISOString() };
+    }
+  } else if (classified.type === 'pdf_document') {
+    // Strategy: for arxiv PDFs, try the HTML version first (better structure,
+    // smaller). If no HTML version exists (common for very recent papers),
+    // download the PDF and extract text via pdftotext (poppler-utils).
+    const hostname = new URL(url).hostname.replace(/^www\./, '');
+    const isArxiv = hostname.includes('arxiv.org');
+    const htmlAlt = isArxiv ? arxivPdfToHtmlUrl(url) : null;
+
+    // 1) Try arxiv HTML alternative
+    if (htmlAlt) {
+      try {
+        console.log(`  Trying arxiv HTML version: ${htmlAlt}`);
+        const res = await httpRequest(htmlAlt);
+        const html = res.body;
+        const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+        const title = titleMatch ? titleMatch[1].trim() : hostname;
+        let text = html
+          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+          .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
+          .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
+          .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
+          .replace(/<[^>]*>/g, ' ')
+          .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (text.length >= 500) {
+          const pathSlug = slugify(new URL(htmlAlt).pathname);
+          const filename = `${slugify(hostname)}-${pathSlug || 'index'}.md`;
+          const filepath = path.join(RAW_DIR, filename);
+          let md = `---\ntitle: "${title.replace(/"/g, '\\"')}"\n`;
+          md += `source: ${url}\n`;
+          md += `source_html: ${htmlAlt}\n`;
+          md += `date: ${new Date().toISOString().slice(0, 10)}\n`;
+          md += `fetched: ${new Date().toISOString().slice(0, 10)}\n`;
+          md += `type: paper\n`;
+          md += `status: raw\n`;
+          md += `fetch_method: arxiv_html_alt\n`;
+          md += `---\n\n# ${title}\n\n**Source:** ${url}\n\n---\n\n${text}`;
+          fs.writeFileSync(filepath, md);
+          manifest[url] = {
+            status: 'fetched', file: `raw/${filename}`, type: 'paper',
+            fetch_method: 'arxiv_html_alt', fetched_at: new Date().toISOString(),
+          };
+          console.log(`  ✓ Saved arxiv HTML → raw/${filename} (${text.length} chars)`);
+          appendLog(`Ingested arxiv (HTML alt): ${url} → raw/${filename}`);
+          return;
+        }
+        console.log(`  HTML version too short (${text.length} chars), falling back to pdftotext`);
+      } catch (e) {
+        console.log(`  HTML version unavailable: ${e.message.split('\n')[0]}`);
+      }
+    }
+
+    // 2) Extract via pdftotext
+    try {
+      console.log(`  Downloading PDF and extracting via pdftotext...`);
+      const text = await fetchViaPdftotext(url);
+      if (!text || text.length < 200) {
+        throw new Error(`Extracted text too short (${text.length} chars)`);
+      }
+      // Try to recover a title: first non-empty line before the first blank line cluster
+      const firstLines = text.split('\n').map(l => l.trim()).filter(Boolean).slice(0, 20);
+      const title = firstLines.find(l => l.length > 8 && l.length < 200) || hostname;
+
+      const pathSlug = slugify(new URL(url).pathname);
+      const filename = `${slugify(hostname)}-${pathSlug || 'index'}.md`;
+      const filepath = path.join(RAW_DIR, filename);
+
+      let md = `---\ntitle: "${title.replace(/"/g, '\\"')}"\n`;
+      md += `source: ${url}\n`;
+      md += `date: ${new Date().toISOString().slice(0, 10)}\n`;
+      md += `fetched: ${new Date().toISOString().slice(0, 10)}\n`;
+      md += `type: paper\n`;
+      md += `status: raw\n`;
+      md += `fetch_method: pdftotext\n`;
+      md += `---\n\n# ${title}\n\n**Source:** ${url}\n\n---\n\n${text}`;
+      fs.writeFileSync(filepath, md);
+      manifest[url] = {
+        status: 'fetched', file: `raw/${filename}`, type: 'paper',
+        fetch_method: 'pdftotext', fetched_at: new Date().toISOString(),
+      };
+      console.log(`  ✓ Saved PDF text → raw/${filename} (${text.length} chars)`);
+      appendLog(`Ingested PDF via pdftotext: ${url} → raw/${filename}`);
+    } catch (err) {
+      console.error(`  ✗ PDF extraction failed: ${err.message.split('\n')[0]}`);
+      manifest[url] = {
+        status: 'failed', error: err.message, fetched_at: new Date().toISOString(),
+      };
     }
   } else if (classified.type === 'web_article') {
     // Fetch HTML, strip tags, save as markdown

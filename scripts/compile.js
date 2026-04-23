@@ -340,6 +340,66 @@ function loadManifest() {
   catch { return {}; }
 }
 
+// ── Code Research Versioning ────────────────────────────────
+
+const CODE_RESEARCH_PATTERN = /^code-research-(.+)-(\d{4}-\d{2}-\d{2})(-\d+)?\.md$/;
+
+function parseCodeResearchFilename(filename) {
+  const match = filename.match(CODE_RESEARCH_PATTERN);
+  if (!match) return null;
+  return {
+    repoName: match[1],
+    date: match[2],
+    counter: match[3] ? parseInt(match[3].slice(1)) : 0,
+  };
+}
+
+function groupCodeResearchByRepo() {
+  const rawFiles = fs.readdirSync(RAW_DIR).filter(f => f.endsWith('.md'));
+  const groups = new Map();
+
+  for (const file of rawFiles) {
+    const parsed = parseCodeResearchFilename(file);
+    if (!parsed) continue;
+    const content = fs.readFileSync(path.join(RAW_DIR, file), 'utf8');
+    const fm = parseFrontmatter(content);
+    if (!groups.has(parsed.repoName)) groups.set(parsed.repoName, []);
+    groups.get(parsed.repoName).push({
+      file,
+      date: parsed.date,
+      counter: parsed.counter,
+      status: fm.status || 'raw',
+      research_goal: fm.research_goal || '',
+    });
+  }
+
+  // Sort each group by date ascending, then counter ascending
+  for (const [, versions] of groups) {
+    versions.sort((a, b) => a.date.localeCompare(b.date) || a.counter - b.counter);
+  }
+
+  return groups;
+}
+
+function cmdGroup() {
+  const groups = groupCodeResearchByRepo();
+
+  if (groups.size === 0) {
+    console.log('\nNo versioned code-research files found.');
+    return;
+  }
+
+  console.log(`\n📂 Code Research Files by Repo (${groups.size} repos)\n`);
+  for (const [repoName, versions] of [...groups.entries()].sort()) {
+    console.log(`  ${repoName} (${versions.length} version${versions.length > 1 ? 's' : ''}):`);
+    versions.forEach((v, i) => {
+      const marker = v.status === 'compiled' ? '✓' : '○';
+      const goalSnippet = v.research_goal ? ` — ${v.research_goal.slice(0, 60)}` : '';
+      console.log(`    ${marker} ${v.file}${goalSnippet}`);
+    });
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────
 
 const cmd = process.argv[2] || 'status';
@@ -348,8 +408,9 @@ switch (cmd) {
   case 'index': cmdIndex(); break;
   case 'health': cmdHealth(); break;
   case 'status': cmdStatus(); break;
+  case 'group': cmdGroup(); break;
   default:
     console.error(`Unknown command: ${cmd}`);
-    console.error('Usage: node scripts/compile.js [delta|index|health|status]');
+    console.error('Usage: node scripts/compile.js [delta|index|health|status|group]');
     process.exit(1);
 }

@@ -8,6 +8,10 @@ argument-hint: "[--full to recompile everything, default is incremental]"
 
 <args> #$ARGUMENTS </args>
 
+## Prerequisites
+
+- `scripts/compile.js` must implement the `group` subcommand (used in Step 2a for multi-version code-research detection). Shipped in kb-skills at commit `d6f4da2` or later — older forks only implement `delta`, `index`, `health`, `status` and will exit with "Unknown command: group". If the local `scripts/compile.js` predates this, re-run `/kb-init` to refresh or copy the updated file from this repo.
+
 ## Step 1: Compute Delta
 
 Run the compile utility to find uncompiled sources:
@@ -25,7 +29,23 @@ Read all uncompiled raw files (or all raw files for --full). For each file, note
 - Key concepts, strategies, people, events mentioned
 - Any claims that might contradict existing wiki articles
 
+### Step 2a: Multi-Version Code Research Detection
+
+For code-research files (type: code-research in frontmatter), check if multiple versions exist for the same repo:
+
+```bash
+node scripts/compile.js group
+```
+
+If a repo has multiple versions:
+- Read ALL versions for that repo (not just uncompiled ones)
+- For repos with 5+ versions: read full content for the latest 2, read only Executive Summary + Key Patterns from older versions
+- Note which version is being compiled (uncompiled) vs. which are context (already compiled)
+- The goal is to produce wiki articles containing the **union** of findings from ALL versions
+
 ## Step 2b: Discuss Key Takeaways (Supervised Mode)
+
+When counting sources for the threshold below, count unique code-research repos (not individual version files). Two versions of claude-code = 1 source, not 2.
 
 If compiling **5 or fewer** sources:
 1. For each source, present a brief summary of key takeaways (3-5 bullet points)
@@ -44,6 +64,18 @@ For each concept/topic identified:
 3. If no article exists → CREATE a new one
 
 **NEVER duplicate articles.** Always search existing wiki first.
+
+### Step 3b: Additive Merge for Multi-Version Code Research
+
+When compiling code-research files that have multiple versions for the same repo, merge findings **ADDITIVELY**:
+
+- A finding present in an earlier version but **absent** in a later version **stays** in the wiki. Absence means "not re-investigated," not "wrong."
+- A finding present in a later version but not earlier ones is **added** to the wiki.
+- A finding present in **both** versions uses the latest version's wording (it may have more detail or better evidence).
+- Only **explicit contradictions** (where a later version says "earlier research reported X, but code analysis shows Y") trigger corrections. Document the correction: "Earlier research reported X; re-analysis found Y [Source: raw/code-research-repo-2026-04-15.md]."
+- The original finding is **NOT silently deleted** — corrections are always documented.
+- Cite the specific versioned file as the source: `[Source: raw/code-research-claude-code-2026-04-15.md]`
+- Preserve all evidence paths from all versions (union).
 
 ## Step 4: Write/Update Wiki Articles
 
