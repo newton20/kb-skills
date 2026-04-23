@@ -8,6 +8,10 @@ argument-hint: "[--full to recompile everything, default is incremental]"
 
 <args> #$ARGUMENTS </args>
 
+## Prerequisites
+
+- `scripts/compile.js` must implement the `group` subcommand (used in Step 2a for multi-version code-research detection). Shipped in kb-skills at commit `d6f4da2` or later — older forks only implement `delta`, `index`, `health`, `status` and will exit with "Unknown command: group". If the local `scripts/compile.js` predates this, re-run `/kb-init` to refresh or copy the updated file from this repo.
+
 ## Step 1: Compute Delta
 
 Run the compile utility to find uncompiled sources:

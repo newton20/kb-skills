@@ -14,7 +14,7 @@ argument-hint: "[URL or path to URL list file]"
 
 Check that these exist:
 - `.env` with `SCRAPECREATORS_API_KEY` and `XAI_API_KEY`
-- `scripts/ingest.js`
+- `scripts/ingest.js` — must include PDF handling (`arxivPdfToHtmlUrl`, `fetchViaPdftotext`, `fetch_method: arxiv_html_alt`), KB_ENV_FILE whitespace tolerance, and the `note_tweet.text` fallback in `fetchViaXApiArticle`. Shipped in kb-skills at commit `d6f4da2` or later. If the local `scripts/ingest.js` predates these features, re-run `/kb-init` to refresh or copy the updated file from this repo.
 - `raw/` directory
 - For PDF sources: `pdftotext` on PATH (poppler-utils / xpdf). Git-for-Windows bundles it at `C:\Program Files\Git\mingw64\bin\pdftotext.exe`. macOS: `brew install poppler`. Ubuntu: `apt install poppler-utils`.
 
