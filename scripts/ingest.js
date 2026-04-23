@@ -127,28 +127,43 @@ function fetchViaAgentBrowser(url) {
   });
 }
 
+// Follow standard HTTP redirects (301/302/303/307/308) and resolve relative
+// Location headers against the current URL (common on academic paper hosts
+// that redirect /pdf/X → /download/paper.pdf without an absolute prefix).
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 function downloadImage(url, filepath) {
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(filepath);
     https.get(url, res => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        downloadImage(res.headers.location, filepath).then(resolve).catch(reject);
+      if (REDIRECT_STATUSES.has(res.statusCode) && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        downloadImage(next, filepath).then(resolve).catch(reject);
         return;
       }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const file = fs.createWriteStream(filepath);
       res.pipe(file);
       file.on('finish', () => { file.close(); resolve(filepath); });
-    }).on('error', err => { fs.unlink(filepath, () => {}); reject(err); });
+      file.on('error', err => { fs.unlink(filepath, () => {}); reject(err); });
+    }).on('error', reject);
   });
 }
 
 function downloadBinary(url, filepath) {
   return new Promise((resolve, reject) => {
     https.get(url, res => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        downloadBinary(res.headers.location, filepath).then(resolve).catch(reject);
+      if (REDIRECT_STATUSES.has(res.statusCode) && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        downloadBinary(next, filepath).then(resolve).catch(reject);
         return;
       }
       if (res.statusCode !== 200) {
+        res.resume();
         return reject(new Error(`HTTP ${res.statusCode}`));
       }
       const file = fs.createWriteStream(filepath);
@@ -480,9 +495,17 @@ function tweetToMarkdown(url, content, tweetId) {
 }
 
 function articleToMarkdown(url, text, handle, meta = {}) {
+  // An X Article has a title and structured long-form content; a note_tweet
+  // is a long regular tweet with authoritative text but no article framing.
+  // Frontmatter type follows the KB convention: `article` for X Articles,
+  // `tweet` for note_tweets, so compile.js routes them the same way as other
+  // tweets (read as tweet evidence, not article prose).
+  const isXArticle = meta.isXArticle !== false;
   const titleStr = meta.title
     ? `"${meta.title.replace(/"/g, '\\"')}"`
-    : `"X Article by ${handle}"`;
+    : isXArticle
+      ? `"X Article by ${handle}"`
+      : `"Long tweet by @${handle}"`;
   const date = meta.date || new Date().toISOString().slice(0, 10);
 
   let md = `---\ntitle: ${titleStr}\n`;
@@ -491,7 +514,7 @@ function articleToMarkdown(url, text, handle, meta = {}) {
   md += `handle: ${handle}\n`;
   md += `date: ${date}\n`;
   md += `fetched: ${new Date().toISOString().slice(0, 10)}\n`;
-  md += `type: article\n`;
+  md += `type: ${isXArticle ? 'article' : 'tweet'}\n`;
   md += `status: raw\n`;
   if (meta.sourceMethod) md += `source_method: ${meta.sourceMethod}\n`;
   md += `---\n\n`;
@@ -556,14 +579,17 @@ async function ingestUrl(url, manifest, dryRun = false) {
         let articleText = null;
         let meta = {};
         let sourceMethod = null;
+        let isXArticle = true;
         try {
           const xApi = await fetchViaXApiArticle(url);
           articleText = xApi.plainText;
+          isXArticle = xApi.isXArticle;
           meta = {
             title: xApi.title,
             author: xApi.author,
             date: xApi.date,
             metrics: xApi.metrics,
+            isXArticle,
           };
           sourceMethod = xApi.sourceMethod;
           console.log(`  ✓ X API v2 (${sourceMethod.replace('x_api_v2_', '')}): ${articleText.length} chars${xApi.title ? ` — "${xApi.title}"` : ''}`);
@@ -578,15 +604,17 @@ async function ingestUrl(url, manifest, dryRun = false) {
           const filename = `${handle}-${tweetId}.md`;
           const filepath = path.join(RAW_DIR, filename);
           fs.writeFileSync(filepath, articleToMarkdown(url, articleText, handle, meta));
+          const manifestType = isXArticle ? 'x_article' : 'tweet';
+          const label = isXArticle ? 'X Article' : 'long tweet';
           manifest[url] = {
             status: 'fetched',
             file: `raw/${filename}`,
-            type: 'x_article',
+            type: manifestType,
             source_method: sourceMethod,
             fetched_at: new Date().toISOString(),
           };
-          console.log(`  ✓ Saved X Article → raw/${filename} (${articleText.length} chars, ${sourceMethod})`);
-          appendLog(`Ingested X Article via ${sourceMethod}: ${url} → raw/${filename}`);
+          console.log(`  ✓ Saved ${label} → raw/${filename} (${articleText.length} chars, ${sourceMethod})`);
+          appendLog(`Ingested ${label} via ${sourceMethod}: ${url} → raw/${filename}`);
           return;
         }
       }
@@ -627,15 +655,18 @@ async function ingestUrl(url, manifest, dryRun = false) {
       let meta = {};
       let sourceMethod = null;
 
+      let isXArticle = true;
       try {
         console.log(`  Trying X API v2 article endpoint...`);
         const xApi = await fetchViaXApiArticle(url);
         articleText = xApi.plainText;
+        isXArticle = xApi.isXArticle;
         meta = {
           title: xApi.title,
           author: xApi.author,
           date: xApi.date,
           metrics: xApi.metrics,
+          isXArticle,
         };
         sourceMethod = xApi.sourceMethod;
         console.log(`  ✓ X API v2 (${sourceMethod.replace('x_api_v2_', '')}): ${articleText.length} chars${xApi.title ? ` — "${xApi.title}"` : ''}`);
@@ -661,15 +692,17 @@ async function ingestUrl(url, manifest, dryRun = false) {
         const filename = `${handle}-${tweetId}.md`;
         const filepath = path.join(RAW_DIR, filename);
         fs.writeFileSync(filepath, articleToMarkdown(url, articleText, handle, meta));
+        const manifestType = isXArticle ? 'x_article' : 'tweet';
+        const label = isXArticle ? 'X Article' : 'long tweet';
         manifest[url] = {
           status: 'fetched',
           file: `raw/${filename}`,
-          type: 'x_article',
+          type: manifestType,
           source_method: sourceMethod,
           fetched_at: new Date().toISOString(),
         };
-        console.log(`  ✓ Saved X Article → raw/${filename} (${articleText.length} chars, ${sourceMethod})`);
-        appendLog(`Ingested X Article via ${sourceMethod} (ScrapeCreators down): ${url} → raw/${filename}`);
+        console.log(`  ✓ Saved ${label} → raw/${filename} (${articleText.length} chars, ${sourceMethod})`);
+        appendLog(`Ingested ${label} via ${sourceMethod} (ScrapeCreators down): ${url} → raw/${filename}`);
       }
     }
   } else if (classified.type === 'github_repo') {
