@@ -16,6 +16,7 @@ Check that these exist:
 - `.env` with `SCRAPECREATORS_API_KEY` and `XAI_API_KEY`
 - `scripts/ingest.js`
 - `raw/` directory
+- For PDF sources: `pdftotext` on PATH (poppler-utils / xpdf). Git-for-Windows bundles it at `C:\Program Files\Git\mingw64\bin\pdftotext.exe`. macOS: `brew install poppler`. Ubuntu: `apt install poppler-utils`.
 
 If any are missing, tell the user: "Knowledge base not initialized. Run /kb-init first." and create `raw/`, `wiki/`, `outputs/` if they don't exist.
 
@@ -36,6 +37,20 @@ If the script reports errors:
 - **API credit exhaustion**: Tell user to check ScrapeCreators dashboard
 - **X Article fallback**: This is normal — some X posts are articles that need xAI Grok
 - **Network timeout**: Suggest retry with the same URL
+- **`pdftotext not installed on PATH`**: poppler-utils / xpdf is missing. Git-for-Windows ships it at `C:\Program Files\Git\mingw64\bin\pdftotext.exe`; otherwise `brew install poppler` (macOS) or `apt install poppler-utils` (Linux).
+
+## PDF Sources
+
+The ingest script detects PDF URLs (any `*.pdf` or `arxiv.org/pdf/<id>` path) and processes them through a two-stage chain:
+
+1. **arxiv HTML alternative** — For `arxiv.org/pdf/<id>` URLs, the script first tries `arxiv.org/html/<id>`. When available, this is preferred (cleaner structure, smaller, no layout artifacts). Recorded as `fetch_method: arxiv_html_alt`.
+2. **`pdftotext` extraction** — If the HTML version returns 404 (common for brand-new papers) or the URL isn't an arxiv paper, the script downloads the PDF and runs `pdftotext <file> -` (reading-order mode — **not** `-layout`, which interleaves columns on 2-column academic papers). Recorded as `fetch_method: pdftotext`.
+
+**Known pdftotext quirks:**
+- Some xpdf builds (including the one bundled with Git-for-Windows) return exit code 99 for `pdftotext -v`. Don't use `-v` to probe for availability; run the extraction and surface an install hint only on `ENOENT` / exit 127 / "not recognized."
+- The `-layout` flag preserves visual column positions but jumbles reading order on 2-column PDFs. Default mode (no flag) flows columns top-to-bottom, which reads correctly for arxiv-style papers.
+
+**Manual override**: if a paper extracts poorly, fetch via `arxiv.org/abs/<id>` (abstract page) or ask the user for an alternate URL.
 
 ## After Ingestion
 
